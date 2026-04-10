@@ -13,16 +13,22 @@ public class PlayerShooter : MonoBehaviour
     {
         if (loadout == null || loadout.ActiveWeapon == null) return;
 
-        // 발사(기본: 마우스 왼쪽 클릭)
-        if (Input.GetButton("Fire1"))
+        IWeapon activeWeapon = loadout.ActiveWeapon;
+
+        // 자동 연사 무기: 누르고 있는 동안 발사
+        // 단발 무기: 클릭한 순간만 발사
+        bool triggerPressed = activeWeapon.IsAutomatic
+            ? Input.GetButton("Fire1")
+            : Input.GetButtonDown("Fire1");
+
+        if (triggerPressed)
         {
-            loadout.ActiveWeapon.TryFire();
+            activeWeapon.TryFire();
         }
 
-        // 재장전(기본: R)
         if (Input.GetKeyDown(KeyCode.R))
         {
-            loadout.ActiveWeapon.StartReload();
+            activeWeapon.StartReload();
         }
     }
 }

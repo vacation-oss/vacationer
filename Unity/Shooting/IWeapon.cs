@@ -8,6 +8,7 @@ public interface IWeapon
     int CurrentAmmoInMagazine { get; }
     int CurrentReserveAmmo { get; }
     int MagazineSize { get; }
+    bool IsAutomatic { get; }
 
     bool TryFire();
     void StartReload();

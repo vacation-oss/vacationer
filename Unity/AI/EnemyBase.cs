@@ -4,12 +4,10 @@ using UnityEngine.AI;
 /// <summary>
 /// 적 공통 베이스 클래스.
 /// 목표:
-/// - 플레이어 감지
-/// - 추적
-/// - 공격
-/// - 피격
-/// - 사망
-/// - 상태 머신 기반 동작
+/// - 플레이어 감지 / 추적 / 공격
+/// - 피격 / 사망
+/// - 간단한 상태 머신
+/// - 웨이브 시스템 확장에 유리한 구조
 /// </summary>
 [RequireComponent(typeof(NavMeshAgent))]
 public abstract class EnemyBase : MonoBehaviour, IDamageable
@@ -26,29 +24,27 @@ public abstract class EnemyBase : MonoBehaviour, IDamageable
     [SerializeField] protected EnemyType enemyType = EnemyType.Basic;
 
     [Header("Target")]
-    [Tooltip("플레이어 Transform. 비워두면 Tag=Player를 자동 탐색")]
     [SerializeField] protected Transform target;
+    [SerializeField] protected LayerMask targetMask = ~0;
 
     [Header("Detection")]
-    [Tooltip("플레이어를 감지하는 최대 거리")]
     [SerializeField] protected float detectionRange = 18f;
-
-    [Tooltip("공격 시작 거리")]
     [SerializeField] protected float attackRange = 2f;
-
-    [Tooltip("시야 체크용 레이어(벽 가림 검사)")]
     [SerializeField] protected LayerMask obstacleMask;
-
-    [Tooltip("시야/거리 체크 주기(성능 최적화)")]
-    [SerializeField] protected float thinkInterval = 0.1f;
+    [SerializeField] protected float thinkInterval = 0.12f;
 
     [Header("Combat")]
     [SerializeField] protected float maxHealth = 100f;
     [SerializeField] protected float attackDamage = 10f;
     [SerializeField] protected float attackCooldown = 1.2f;
 
+    [Header("Hit Reaction")]
+    [Tooltip("피격 시 이동/공격이 잠깐 멈추는 시간")]
+    [SerializeField] protected float hitStunDuration = 0.07f;
+    [Tooltip("피격 시 몸이 뒤로 밀리는 거리")]
+    [SerializeField] protected float hitPushDistance = 0.12f;
+
     [Header("Death")]
-    [Tooltip("사망 후 삭제까지 대기 시간")]
     [SerializeField] protected float destroyDelay = 3f;
 
     protected NavMeshAgent agent;
@@ -57,39 +53,52 @@ public abstract class EnemyBase : MonoBehaviour, IDamageable
     protected float nextAttackTime;
     protected float nextThinkTime;
 
-    // 거리 계산 최적화용
     protected float detectionRangeSqr;
     protected float attackRangeSqr;
+    protected IDamageable cachedTargetDamageable;
+
+    protected float hitStunTimer;
 
     public EnemyType Type => enemyType;
     public bool IsDead => state == EnemyState.Dead;
+    public float HealthNormalized => maxHealth <= 0f ? 0f : currentHealth / maxHealth;
 
     protected virtual void Awake()
     {
         agent = GetComponent<NavMeshAgent>();
-        currentHealth = maxHealth;
 
         detectionRangeSqr = detectionRange * detectionRange;
         attackRangeSqr = attackRange * attackRange;
 
-        if (target == null)
-        {
-            GameObject player = GameObject.FindGameObjectWithTag("Player");
-            if (player != null) target = player.transform;
-        }
+        currentHealth = maxHealth;
+        ResolveTarget();
     }
 
     protected virtual void OnEnable()
     {
-        state = EnemyState.Idle;
+        ResetRuntimeState();
         EnemyEvents.RaiseSpawned(this);
+    }
+
+    public virtual void InitializeForSpawn(Transform forcedTarget)
+    {
+        target = forcedTarget;
+        cachedTargetDamageable = target != null ? target.GetComponentInParent<IDamageable>() : null;
+
+        currentHealth = maxHealth;
+        ResetRuntimeState();
     }
 
     protected virtual void Update()
     {
         if (state == EnemyState.Dead || target == null) return;
 
-        // 매 프레임 전체 계산을 하지 않고 주기적으로 판단
+        if (hitStunTimer > 0f)
+        {
+            hitStunTimer -= Time.deltaTime;
+            return;
+        }
+
         if (Time.time >= nextThinkTime)
         {
             nextThinkTime = Time.time + thinkInterval;
@@ -99,15 +108,13 @@ public abstract class EnemyBase : MonoBehaviour, IDamageable
         TickState();
     }
 
-    /// <summary>
-    /// 상태 전이 판단.
-    /// </summary>
     protected virtual void EvaluateState()
     {
         Vector3 toTarget = target.position - transform.position;
         float distSqr = toTarget.sqrMagnitude;
 
-        bool canDetect = distSqr <= detectionRangeSqr && HasLineOfSight(target.position);
+        bool isTargetInLayer = (targetMask.value & (1 << target.gameObject.layer)) != 0;
+        bool canDetect = isTargetInLayer && distSqr <= detectionRangeSqr && HasLineOfSight(target.position);
 
         if (!canDetect)
         {
@@ -115,35 +122,25 @@ public abstract class EnemyBase : MonoBehaviour, IDamageable
             return;
         }
 
-        if (distSqr <= attackRangeSqr)
-        {
-            SetState(EnemyState.Attack);
-        }
-        else
-        {
-            SetState(EnemyState.Chase);
-        }
+        SetState(distSqr <= attackRangeSqr ? EnemyState.Attack : EnemyState.Chase);
     }
 
-    /// <summary>
-    /// 상태별 동작 처리.
-    /// </summary>
     protected virtual void TickState()
     {
         switch (state)
         {
             case EnemyState.Idle:
-                agent.isStopped = true;
                 break;
 
             case EnemyState.Chase:
-                agent.isStopped = false;
-                agent.SetDestination(target.position);
+                if (agent.enabled)
+                {
+                    agent.SetDestination(target.position);
+                }
                 break;
 
             case EnemyState.Attack:
-                agent.isStopped = true;
-                transform.LookAt(new Vector3(target.position.x, transform.position.y, target.position.z));
+                FaceTargetOnY();
                 TryAttack();
                 break;
         }
@@ -152,7 +149,31 @@ public abstract class EnemyBase : MonoBehaviour, IDamageable
     protected virtual void SetState(EnemyState newState)
     {
         if (state == newState) return;
+
+        EnemyState previous = state;
         state = newState;
+        OnStateChanged(previous, newState);
+    }
+
+    protected virtual void OnStateChanged(EnemyState previous, EnemyState next)
+    {
+        if (!agent.enabled) return;
+
+        switch (next)
+        {
+            case EnemyState.Idle:
+                agent.isStopped = true;
+                break;
+            case EnemyState.Chase:
+                agent.isStopped = false;
+                break;
+            case EnemyState.Attack:
+                agent.isStopped = true;
+                break;
+            case EnemyState.Dead:
+                agent.isStopped = true;
+                break;
+        }
     }
 
     protected virtual void TryAttack()
@@ -160,14 +181,16 @@ public abstract class EnemyBase : MonoBehaviour, IDamageable
         if (Time.time < nextAttackTime) return;
 
         nextAttackTime = Time.time + attackCooldown;
+        PerformAttack();
+    }
 
-        IDamageable damageable = target.GetComponentInParent<IDamageable>();
-        if (damageable != null)
-        {
-            Vector3 hitPoint = target.position;
-            Vector3 hitNormal = (target.position - transform.position).normalized;
-            damageable.TakeDamage(attackDamage, hitPoint, hitNormal, gameObject);
-        }
+    protected virtual void PerformAttack()
+    {
+        if (cachedTargetDamageable == null) return;
+
+        Vector3 hitPoint = target.position;
+        Vector3 hitNormal = (target.position - transform.position).normalized;
+        cachedTargetDamageable.TakeDamage(attackDamage, hitPoint, hitNormal, gameObject);
     }
 
     public virtual void TakeDamage(float amount, Vector3 hitPoint, Vector3 hitNormal, GameObject instigator)
@@ -175,28 +198,36 @@ public abstract class EnemyBase : MonoBehaviour, IDamageable
         if (state == EnemyState.Dead) return;
 
         currentHealth -= amount;
+
+        // 피격 반응: 잠깐 경직 + 가벼운 넉백
+        hitStunTimer = hitStunDuration;
+        if (agent.enabled)
+        {
+            agent.ResetPath();
+        }
+        transform.position += -hitNormal.normalized * hitPushDistance;
+
         if (currentHealth <= 0f)
         {
             Die();
+            return;
         }
-        else
-        {
-            // 피격 시 잠깐 추적 상태로 전환해 즉각 반응
-            SetState(EnemyState.Chase);
-        }
+
+        SetState(EnemyState.Chase);
     }
 
     protected virtual void Die()
     {
         if (state == EnemyState.Dead) return;
 
-        state = EnemyState.Dead;
-        agent.isStopped = true;
-        agent.enabled = false;
+        SetState(EnemyState.Dead);
+
+        if (agent.enabled)
+        {
+            agent.enabled = false;
+        }
 
         EnemyEvents.RaiseDied(this);
-
-        // 웨이브 시스템이 이벤트 처리 후 정리할 수 있도록 약간의 유예를 둔다.
         Invoke(nameof(Despawn), destroyDelay);
     }
 
@@ -209,12 +240,47 @@ public abstract class EnemyBase : MonoBehaviour, IDamageable
     protected virtual bool HasLineOfSight(Vector3 targetPos)
     {
         Vector3 origin = transform.position + Vector3.up * 1.2f;
-        Vector3 dir = targetPos - origin;
-        float distance = dir.magnitude;
+        Vector3 direction = targetPos - origin;
+        float distance = direction.magnitude;
 
         if (distance <= 0.01f) return true;
 
-        return !Physics.Raycast(origin, dir.normalized, distance, obstacleMask, QueryTriggerInteraction.Ignore);
+        return !Physics.Raycast(origin, direction / distance, distance, obstacleMask, QueryTriggerInteraction.Ignore);
+    }
+
+    protected virtual void ResolveTarget()
+    {
+        if (target == null)
+        {
+            GameObject player = GameObject.FindGameObjectWithTag("Player");
+            if (player != null)
+            {
+                target = player.transform;
+            }
+        }
+
+        cachedTargetDamageable = target != null ? target.GetComponentInParent<IDamageable>() : null;
+    }
+
+    protected virtual void FaceTargetOnY()
+    {
+        Vector3 lookPoint = new Vector3(target.position.x, transform.position.y, target.position.z);
+        transform.LookAt(lookPoint);
+    }
+
+    protected virtual void ResetRuntimeState()
+    {
+        CancelInvoke();
+        state = EnemyState.Idle;
+        hitStunTimer = 0f;
+        nextAttackTime = 0f;
+        nextThinkTime = Time.time + Random.Range(0f, thinkInterval);
+
+        if (agent.enabled)
+        {
+            agent.isStopped = true;
+            agent.ResetPath();
+        }
     }
 
     private void OnDrawGizmosSelected()
